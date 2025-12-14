@@ -2,12 +2,39 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use slatedb::{Db, DbIterator, DbSnapshot, WriteBatch};
+use slatedb::{
+    Db, DbIterator, DbSnapshot, MergeOperator as SlateDbMergeOperator, MergeOperatorError,
+    WriteBatch,
+};
 
 use crate::{
     BytesRange, Record, StorageError, StorageIterator, StorageRead, StorageResult,
-    storage::{Storage, StorageSnapshot},
+    storage::{MergeOperator, Storage, StorageSnapshot},
 };
+
+/// Adapter that wraps our `MergeOperator` trait to implement SlateDB's `MergeOperator` trait.
+///
+/// This allows using our common merge operator interface with SlateDB's merge functionality.
+pub(crate) struct SlateDbMergeOperatorAdapter {
+    operator: Arc<dyn MergeOperator>,
+}
+
+impl SlateDbMergeOperatorAdapter {
+    fn new(operator: Arc<dyn MergeOperator>) -> Self {
+        Self { operator }
+    }
+}
+
+impl SlateDbMergeOperator for SlateDbMergeOperatorAdapter {
+    fn merge(
+        &self,
+        key: &Bytes,
+        existing_value: Option<Bytes>,
+        value: Bytes,
+    ) -> Result<Bytes, MergeOperatorError> {
+        Ok(self.operator.merge(key, existing_value, value))
+    }
+}
 
 /// SlateDB-backed implementation of the Storage trait.
 ///
@@ -21,6 +48,25 @@ impl SlateDbStorage {
     /// Creates a new SlateDbStorage instance wrapping the given SlateDB database.
     pub fn new(db: Arc<Db>) -> Self {
         Self { db }
+    }
+
+    /// Creates a SlateDB `MergeOperator` from our common `MergeOperator` trait.
+    ///
+    /// This adapter can be used when constructing a SlateDB database with a merge operator:
+    /// ```rust,ignore
+    /// use opendata_common::storage::MergeOperator;
+    /// use slatedb::{DbBuilder, object_store::ObjectStore};
+    ///
+    /// let my_merge_op: Arc<dyn MergeOperator> = Arc::new(MyMergeOperator);
+    /// let slate_merge_op = SlateDbStorage::merge_operator_adapter(my_merge_op);
+    ///
+    /// let db = DbBuilder::new("path", object_store)
+    ///     .with_merge_operator(Arc::new(slate_merge_op))
+    ///     .build()
+    ///     .await?;
+    /// ```
+    pub fn merge_operator_adapter(operator: Arc<dyn MergeOperator>) -> SlateDbMergeOperatorAdapter {
+        SlateDbMergeOperatorAdapter::new(operator)
     }
 }
 
@@ -127,6 +173,28 @@ impl Storage for SlateDbStorage {
             .write(batch)
             .await
             .map_err(StorageError::from_storage)?;
+        Ok(())
+    }
+
+    /// Merges values for the given keys using SlateDB's merge operator.
+    ///
+    /// This method requires the database to be configured with a merge operator
+    /// during construction. If no merge operator is configured, this will return
+    /// a `StorageError::Storage` error.
+    async fn merge(&self, records: Vec<Record>) -> StorageResult<()> {
+        let mut batch = WriteBatch::new();
+        for record in records {
+            batch.merge(record.key, record.value);
+        }
+        self.db.write(batch).await.map_err(|e| {
+            let error_msg = e.to_string();
+            // Check if the error indicates merge operator is not configured
+            if error_msg.contains("merge operator") || error_msg.contains("not configured") {
+                StorageError::Storage("Merge operator not configured for this database".to_string())
+            } else {
+                StorageError::from_storage(e)
+            }
+        })?;
         Ok(())
     }
 

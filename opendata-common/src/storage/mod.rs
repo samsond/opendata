@@ -54,6 +54,23 @@ impl StorageError {
 /// Result type alias for storage operations
 pub type StorageResult<T> = std::result::Result<T, StorageError>;
 
+/// Trait for merging existing values with new values.
+///
+/// Merge operators must be associative: `merge(merge(a, b), c) == merge(a, merge(b, c))`.
+/// This ensures consistent merging behavior regardless of the order of operations.
+pub trait MergeOperator: Send + Sync {
+    /// Merges an existing value with a new value to produce a merged result.
+    ///
+    /// # Arguments
+    /// * `key` - The key associated with the values being merged
+    /// * `existing_value` - The current value stored in the database (if any)
+    /// * `new_value` - The new value to merge with the existing value
+    ///
+    /// # Returns
+    /// The merged value.
+    fn merge(&self, key: &Bytes, existing_value: Option<Bytes>, new_value: Bytes) -> Bytes;
+}
+
 /// Iterator over storage records.
 #[async_trait]
 pub trait StorageIterator {
@@ -96,10 +113,19 @@ pub trait StorageRead: Send + Sync {
 pub trait StorageSnapshot: StorageRead {}
 
 /// The storage type encapsulates access to the underlying storage (e.g. SlateDB).
-/// TODO(agavra): figure out how to model merge operations
 #[async_trait]
 pub trait Storage: StorageRead {
     async fn put(&self, records: Vec<Record>) -> StorageResult<()>;
+
+    /// Merges values for the given keys using the configured merge operator.
+    ///
+    /// This method requires the underlying storage engine to be configured with
+    /// a merge operator. If no merge operator is configured, this method will
+    /// return a `StorageError::Storage` error.
+    ///
+    /// The merge operation is atomic - all merges in the batch are applied
+    /// together or not at all.
+    async fn merge(&self, records: Vec<Record>) -> StorageResult<()>;
 
     /// Creates a point-in-time snapshot of the storage.
     ///

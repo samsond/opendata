@@ -3,9 +3,9 @@ use std::ops::RangeBounds;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
-use super::{Storage, StorageSnapshot};
+use super::{MergeOperator, Storage, StorageSnapshot};
 use crate::{BytesRange, Record, StorageError, StorageIterator, StorageRead, StorageResult};
 
 /// In-memory implementation of the Storage trait using a BTreeMap.
@@ -14,6 +14,7 @@ use crate::{BytesRange, Record, StorageError, StorageIterator, StorageRead, Stor
 /// or scenarios where durability is not required.
 pub struct InMemoryStorage {
     data: Arc<RwLock<BTreeMap<Bytes, Bytes>>>,
+    merge_operator: Option<Arc<dyn MergeOperator + Send + Sync>>,
 }
 
 impl InMemoryStorage {
@@ -21,6 +22,19 @@ impl InMemoryStorage {
     pub fn new() -> Self {
         Self {
             data: Arc::new(RwLock::new(BTreeMap::new())),
+            merge_operator: None,
+        }
+    }
+
+    /// Creates a new InMemoryStorage instance with an optional merge operator.
+    ///
+    /// If a merge operator is provided, the `merge` method will use it to combine
+    /// existing values with new values. If no merge operator is provided, the
+    /// `merge` method will return an error.
+    pub fn with_merge_operator(merge_operator: Arc<dyn MergeOperator + Send + Sync>) -> Self {
+        Self {
+            data: Arc::new(RwLock::new(BTreeMap::new())),
+            merge_operator: Some(merge_operator),
         }
     }
 }
@@ -142,6 +156,40 @@ impl Storage for InMemoryStorage {
         Ok(())
     }
 
+    /// Merges values for the given keys using the configured merge operator.
+    ///
+    /// This method requires a merge operator to be configured during construction.
+    /// For each record, it will:
+    /// 1. Get the existing value (if any)
+    /// 2. Call the merge operator to combine existing and new values
+    /// 3. Put the merged result back
+    ///
+    /// If no merge operator is configured, this method will return a
+    /// `StorageError::Storage` error.
+    async fn merge(&self, records: Vec<Record>) -> StorageResult<()> {
+        let merge_op = self
+            .merge_operator
+            .as_ref()
+            .ok_or_else(|| {
+                StorageError::Storage(
+                    "Merge operator not configured: in-memory storage requires a merge operator to be set during construction".to_string(),
+                )
+            })?;
+
+        let mut data = self
+            .data
+            .write()
+            .map_err(|e| StorageError::Internal(format!("Failed to acquire write lock: {}", e)))?;
+
+        for record in records {
+            let existing_value = data.get(&record.key).cloned();
+            let merged_value = merge_op.merge(&record.key, existing_value, record.value.clone());
+            data.insert(record.key, merged_value);
+        }
+
+        Ok(())
+    }
+
     /// Creates a point-in-time snapshot of the in-memory storage.
     ///
     /// The snapshot provides a consistent read-only view of the database at the time
@@ -166,6 +214,23 @@ impl Storage for InMemoryStorage {
 mod tests {
     use super::*;
     use std::ops::Bound;
+
+    /// Test merge operator that appends new value to existing value with a separator.
+    struct AppendMergeOperator;
+
+    impl MergeOperator for AppendMergeOperator {
+        fn merge(&self, _key: &Bytes, existing_value: Option<Bytes>, new_value: Bytes) -> Bytes {
+            match existing_value {
+                Some(existing) => {
+                    let mut result = BytesMut::from(existing);
+                    result.extend_from_slice(b",");
+                    result.extend_from_slice(&new_value);
+                    result.freeze()
+                }
+                None => new_value,
+            }
+        }
+    }
 
     #[tokio::test]
     async fn should_return_none_when_key_not_found() {
@@ -435,6 +500,118 @@ mod tests {
 
         // when
         storage.put(vec![Record::empty(key.clone())]).await.unwrap();
+        let result = storage.get(key).await.unwrap();
+
+        // then
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().value, Bytes::new());
+    }
+
+    #[tokio::test]
+    async fn should_return_error_when_merge_operator_not_configured() {
+        // given
+        let storage = InMemoryStorage::new();
+        let record = Record::new(Bytes::from("key1"), Bytes::from("value1"));
+
+        // when
+        let result = storage.merge(vec![record]).await;
+
+        // then
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Merge operator not configured")
+        );
+    }
+
+    #[tokio::test]
+    async fn should_merge_when_key_does_not_exist() {
+        // given
+        let merge_op = Arc::new(AppendMergeOperator);
+        let storage = InMemoryStorage::with_merge_operator(merge_op);
+        let key = Bytes::from("new_key");
+        let value = Bytes::from("value1");
+
+        // when
+        storage
+            .merge(vec![Record::new(key.clone(), value.clone())])
+            .await
+            .unwrap();
+        let result = storage.get(key).await.unwrap();
+
+        // then
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().value, value);
+    }
+
+    #[tokio::test]
+    async fn should_merge_when_key_exists() {
+        // given
+        let merge_op = Arc::new(AppendMergeOperator);
+        let storage = InMemoryStorage::with_merge_operator(merge_op);
+        let key = Bytes::from("key1");
+        let initial_value = Bytes::from("value1");
+        let new_value = Bytes::from("value2");
+
+        storage
+            .put(vec![Record::new(key.clone(), initial_value)])
+            .await
+            .unwrap();
+
+        // when
+        storage
+            .merge(vec![Record::new(key.clone(), new_value)])
+            .await
+            .unwrap();
+        let result = storage.get(key).await.unwrap();
+
+        // then
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().value, Bytes::from("value1,value2"));
+    }
+
+    #[tokio::test]
+    async fn should_merge_multiple_keys() {
+        // given
+        let merge_op = Arc::new(AppendMergeOperator);
+        let storage = InMemoryStorage::with_merge_operator(merge_op);
+        let records = vec![
+            Record::new(Bytes::from("key1"), Bytes::from("value1")),
+            Record::new(Bytes::from("key2"), Bytes::from("value2")),
+        ];
+        storage.put(records).await.unwrap();
+
+        // when
+        storage
+            .merge(vec![
+                Record::new(Bytes::from("key1"), Bytes::from("value1a")),
+                Record::new(Bytes::from("key2"), Bytes::from("value2a")),
+            ])
+            .await
+            .unwrap();
+
+        // then
+        let result1 = storage.get(Bytes::from("key1")).await.unwrap();
+        assert_eq!(result1.unwrap().value, Bytes::from("value1,value1a"));
+
+        let result2 = storage.get(Bytes::from("key2")).await.unwrap();
+        assert_eq!(result2.unwrap().value, Bytes::from("value2,value2a"));
+    }
+
+    #[tokio::test]
+    async fn should_merge_empty_values() {
+        // given
+        let merge_op = Arc::new(AppendMergeOperator);
+        let storage = InMemoryStorage::with_merge_operator(merge_op);
+        let key = Bytes::from("key1");
+
+        // when
+        storage
+            .merge(vec![Record::empty(key.clone())])
+            .await
+            .unwrap();
         let result = storage.get(key).await.unwrap();
 
         // then
