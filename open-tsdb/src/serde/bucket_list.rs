@@ -1,0 +1,78 @@
+// BucketList value structure
+
+use super::common::*;
+
+/// BucketList value: SingleArray<(bucket_size: u8, time_bucket: u32)>
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketListValue {
+    pub buckets: Vec<(TimeBucketSize, TimeBucket)>,
+}
+
+impl BucketListValue {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        encode_single_array(&self.buckets, &mut buf);
+        buf
+    }
+
+    pub fn decode(buf: &[u8], count: usize) -> Result<Self, EncodingError> {
+        let mut slice = buf;
+        let buckets = decode_single_array(&mut slice, count)?;
+        Ok(BucketListValue { buckets })
+    }
+}
+
+impl Encode for (TimeBucketSize, TimeBucket) {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.push(self.0);
+        buf.extend_from_slice(&self.1.to_le_bytes());
+    }
+}
+
+impl Decode for (TimeBucketSize, TimeBucket) {
+    fn decode(buf: &mut &[u8]) -> Result<Self, EncodingError> {
+        if buf.len() < 1 + 4 {
+            return Err(EncodingError {
+                message: "Buffer too short for (TimeBucketSize, TimeBucket)".to_string(),
+            });
+        }
+        let bucket_size = buf[0];
+        *buf = &buf[1..];
+        let time_bucket = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        *buf = &buf[4..];
+        Ok((bucket_size, time_bucket))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_encode_and_decode_bucket_list_value() {
+        // given
+        let value = BucketListValue {
+            buckets: vec![(1, 100), (2, 200), (3, 300)],
+        };
+
+        // when
+        let encoded = value.encode();
+        let decoded = BucketListValue::decode(&encoded, 3).unwrap();
+
+        // then
+        assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn should_encode_and_decode_empty_bucket_list_value() {
+        // given
+        let value = BucketListValue { buckets: vec![] };
+
+        // when
+        let encoded = value.encode();
+        let decoded = BucketListValue::decode(&encoded, 0).unwrap();
+
+        // then
+        assert_eq!(decoded, value);
+    }
+}

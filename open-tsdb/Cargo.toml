@@ -6,3 +6,8 @@ edition.workspace = true
 [dependencies]
 slatedb.workspace = true
 opendata-common.workspace = true
+roaring = "0.7"
+tsz = "0.1"
+
+[dev-dependencies]
+rstest = "0.19"

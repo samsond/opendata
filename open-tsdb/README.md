@@ -23,10 +23,15 @@ Examples of this convention:
 
 All records use a standard, 2-byte prefix: a single `u8` for the record version and
 another `u8` for the record tag. The record tag is encoded as two 4-bit fields. The
-high 4 bits are the record type. The lower 4 bits depend on the scope of scope of
-the reocrd. Globally scoped records set the lower 4 bits to 0x00 for future use and
-bucket scoped records set the lower 4 bits to encdoe the `TimeBucketSize` (e.g. 1
-for a single Hour) allowing different time granularities to coexist. 
+high 4 bits are the record type. The lower 4 bits depend on the scope of the record.
+Globally scoped records set the lower 4 bits to 0x00 for future use and bucket scoped
+records set the lower 4 bits to encode the `TimeBucketSize` allowing different time
+granularities to coexist.
+
+The `TimeBucketSize` is encoded exponentially: a value of `n` represents `2^(n-1)` hours.
+For example, `1` = 1 hour, `2` = 2 hours, `3` = 4 hours, `4` = 8 hours, etc. This allows
+the system to efficiently represent a wide range of time bucket sizes (1 hour to 16,384 hours)
+using only 4 bits. 
 
 ```
 record_tag byte layout (global-scoped):
@@ -215,9 +220,7 @@ dictionaries.
 ├──────────────────────────────────────────────────────────────────────────┤
 │  metric_unit:        OptionalNonEmptyUtf8                                │
 │  metric_meta:        MetricMeta                                          │
-│  resource_count:     u16                                                 │
-│  scope_count:        u16                                                 │
-│  point_count:        u16                                                 │
+│  attr_count:         u16                                                 │
 │  attrs:              Array<AttributeBinding>                             │
 │                                                                          │
 │  MetricMeta                                                              │
@@ -240,8 +243,8 @@ dictionaries.
 - `metric_meta` (`MetricMeta`): Encodes the series' metric type and auxiliary flags.
   - `metric_type` (u8): Enumeration matching `TimeSeriesSpec::metric_type` — `1=Gauge`, `2=Sum`, `3=Histogram`, `4=ExponentialHistogram`, `5=Summary`.
   - `flags` (u8): Bit-packed metadata; bits `0-1` store temporality (`0=Unspecified`, `1=Cumulative`, `2=Delta`), bit `2` is the `monotonic` flag (only meaningful when `metric_type=2`), remaining bits are reserved and must be zero.
-- `resource_count` / `scope_count` / `point_count` (u16): Cardinalities of each attribute group.
-- `resource_attrs`, `scope_attrs`, `point_attrs` (`Array<AttributeBinding>`): Attribute bindings grouped by their source context. Each is encoded as `resource_count` / `scope_count` / `point_count` followed by that many `AttributeBinding` entries.
+- `attr_count` (u16): Total number of attribute bindings.
+- `attrs` (`Array<AttributeBinding>`): All attribute bindings encoded as `attr_count` followed by that many `AttributeBinding` entries.
   - `attr` (`Utf8`): Attribute name.
   - `value` (`Utf8`): Attribute value.
 
