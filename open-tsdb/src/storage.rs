@@ -32,7 +32,7 @@ impl OpenTsdbStorage {
     /// candidate buckets (as opposed to computing theoretical buckets from the
     /// start and end times).
     #[tracing::instrument(level = "trace", skip_all)]
-    async fn get_buckets_in_range(
+    pub(crate) async fn get_buckets_in_range(
         &self,
         start_secs: Option<i64>,
         end_secs: Option<i64>,
@@ -83,7 +83,7 @@ impl OpenTsdbStorage {
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
-    async fn get_forward_index(&self, bucket: TimeBucket) -> Result<ForwardIndex> {
+    pub(crate) async fn get_forward_index(&self, bucket: TimeBucket) -> Result<ForwardIndex> {
         let range = ForwardIndexKey::bucket_range(&bucket);
         let records = self.inner.scan(range).await?;
 
@@ -98,7 +98,7 @@ impl OpenTsdbStorage {
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
-    async fn get_inverted_index(&self, bucket: TimeBucket) -> Result<InvertedIndex> {
+    pub(crate) async fn get_inverted_index(&self, bucket: TimeBucket) -> Result<InvertedIndex> {
         let range = InvertedIndexKey::bucket_range(&bucket);
         let records = self.inner.scan(range).await?;
 
@@ -122,12 +122,12 @@ impl OpenTsdbStorage {
     /// return the maximum series ID found, which can be used to
     /// initialize counters
     #[tracing::instrument(level = "trace", skip_all)]
-    async fn load_series_dictionary(
+    pub(crate) async fn load_series_dictionary(
         &self,
-        bucket: TimeBucket,
+        bucket: &TimeBucket,
         series_dict: &mut HashMap<SeriesFingerprint, SeriesId>,
     ) -> Result<u32> {
-        let range = SeriesDictionaryKey::bucket_range(&bucket);
+        let range = SeriesDictionaryKey::bucket_range(bucket);
         let records = self.inner.scan(range).await?;
 
         let mut max_series_id = 0;

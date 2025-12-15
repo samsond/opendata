@@ -78,7 +78,7 @@ pub(crate) fn fingerprint_string(value: &str) -> u64 {
     u64::from_le_bytes(first8)
 }
 
-trait Fingerprint {
+pub(crate) trait Fingerprint {
     fn fingerprint(&self) -> u128;
 }
 
@@ -173,6 +173,13 @@ pub fn hour_bucket_in_epoch_minutes(time: SystemTime) -> Result<u32> {
 pub fn hour_bucket_unix_secs(time: SystemTime) -> Option<u64> {
     let secs = time.duration_since(UNIX_EPOCH).ok()?.as_secs();
     Some(secs - (secs % 3600))
+}
+
+pub(crate) fn normalize_str(s: &str) -> Option<String> {
+    if s.is_empty() {
+        return None;
+    }
+    Some(s.to_string())
 }
 
 #[cfg(test)]

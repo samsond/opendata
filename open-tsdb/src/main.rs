@@ -1,6 +1,8 @@
 #![allow(dead_code)]
+mod delta;
 mod index;
 mod model;
+mod otel;
 mod serde;
 mod storage;
 mod util;

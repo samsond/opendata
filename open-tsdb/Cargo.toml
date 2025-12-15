@@ -12,8 +12,10 @@ opendata-common.workspace = true
 slatedb.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 
 blake3 = "1.8.2"
+opentelemetry-proto = "0.30"
 promql-parser = "0.6"
 roaring = "0.7"
 tsz = "0.1"
