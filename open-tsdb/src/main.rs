@@ -3,6 +3,7 @@ mod delta;
 mod index;
 mod model;
 mod otel;
+mod promql;
 mod serde;
 mod storage;
 mod tsdb;
