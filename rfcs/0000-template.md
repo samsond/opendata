@@ -3,7 +3,7 @@
 **Status**: Draft | Under Review | Accepted | Rejected | Superseded
 
 **Authors**:
-- Name <email>
+- [Name](https://github.com/username)
 
 ## Summary
 
