@@ -5,6 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use clap::Parser;
+use opendata_common::storage::config::StorageConfig;
 use serde::Deserialize;
 
 use crate::util::Result;
@@ -24,12 +25,33 @@ pub struct CliArgs {
 }
 
 /// Root configuration matching prometheus.yaml structure.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct PrometheusConfig {
     #[serde(default)]
     pub global: GlobalConfig,
     #[serde(default)]
     pub scrape_configs: Vec<ScrapeConfig>,
+    #[serde(default)]
+    pub storage: StorageConfig,
+    /// Flush interval in seconds for persisting data to storage.
+    /// Defaults to 5 seconds.
+    #[serde(default = "default_flush_interval_secs")]
+    pub flush_interval_secs: u64,
+}
+
+fn default_flush_interval_secs() -> u64 {
+    5
+}
+
+impl Default for PrometheusConfig {
+    fn default() -> Self {
+        Self {
+            global: GlobalConfig::default(),
+            scrape_configs: Vec::new(),
+            storage: StorageConfig::default(),
+            flush_interval_secs: default_flush_interval_secs(),
+        }
+    }
 }
 
 /// Global configuration defaults.

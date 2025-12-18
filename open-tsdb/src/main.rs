@@ -16,7 +16,7 @@ mod util;
 use std::sync::Arc;
 
 use clap::Parser;
-use opendata_common::storage::in_memory::InMemoryStorage;
+use opendata_common::storage::factory::create_storage;
 
 use promql::config::{CliArgs, PrometheusConfig, load_config};
 use promql::server::{PromqlServer, ServerConfig};
@@ -48,10 +48,19 @@ async fn main() {
         PrometheusConfig::default()
     };
 
-    // Create in-memory storage with merge operator
-    let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-        OpenTsdbMergeOperator,
-    )));
+    // Create storage based on configuration
+    tracing::info!(
+        "Creating storage with config: {:?}",
+        prometheus_config.storage
+    );
+    let merge_operator = Arc::new(OpenTsdbMergeOperator);
+    let storage = create_storage(&prometheus_config.storage, Some(merge_operator))
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("Failed to create storage: {}", e);
+            std::process::exit(1);
+        });
+    tracing::info!("Storage created successfully");
 
     // Create Tsdb
     let tsdb = Arc::new(Tsdb::new(storage));

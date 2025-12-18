@@ -32,9 +32,9 @@ pub(crate) struct AppState {
 }
 
 /// Server configuration
-pub(crate) struct ServerConfig {
-    pub(crate) port: u16,
-    pub(crate) prometheus_config: PrometheusConfig,
+pub struct ServerConfig {
+    pub port: u16,
+    pub prometheus_config: PrometheusConfig,
 }
 
 impl Default for ServerConfig {
@@ -84,10 +84,15 @@ impl PromqlServer {
             tracing::info!("No scrape configs found, scraper not started");
         }
 
-        // Start the flush timer (flushes TSDB every 30 seconds)
+        // Start the flush timer
+        let flush_interval_secs = self.config.prometheus_config.flush_interval_secs;
         let tsdb_for_flush = self.tsdb.clone();
         tokio::spawn(async move {
-            let mut ticker = interval(Duration::from_secs(30));
+            let mut ticker = interval(Duration::from_secs(flush_interval_secs));
+            tracing::info!(
+                "Starting flush timer with {}s interval",
+                flush_interval_secs
+            );
             loop {
                 ticker.tick().await;
                 if let Err(e) = tsdb_for_flush.flush().await {
