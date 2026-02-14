@@ -3,22 +3,25 @@ use std::collections::HashMap;
 use super::evaluator::{EvalResult, EvalSample, EvalSamples};
 use crate::model::Sample;
 
-/// Kahan summation increment with Neumaier improvement
-/// Performs addition of a value to a running sum with compensation
+/// Kahan summation increment with Neumaier improvement (1974)
+///
+/// Performs compensated summation to minimize floating-point rounding errors.
+/// The Neumaier variant handles the case where the next term is larger than
+/// the running sum, which the original Kahan algorithm (1965) did not address.
+///
 /// Returns (new_sum, new_compensation)
 #[inline(never)]
 // Important: do NOT inline.
-// Prometheus observed precision regressions when the compiler reordered
-// floating-point operations during inlining. We lock behavior to match
-// Prometheus' IEEE-754 semantics exactly.
-// See: https://github.com/prometheus/prometheus/issues/16714
+// Compiler reordering of floating-point operations can cause precision loss.
+// This was observed in Prometheus (issue #16714) and we lock the behavior
+// to maintain IEEE-754 semantics exactly.
 fn kahan_inc(inc: f64, sum: f64, c: f64) -> (f64, f64) {
     let t = sum + inc;
 
     let new_c = if t.is_infinite() {
         0.0
     } else if sum.abs() >= inc.abs() {
-        // Neumaier improvement: swap if next term larger than sum
+        // Neumaier improvement: swap roles when next term is larger
         c + ((sum - t) + inc)
     } else {
         c + ((inc - t) + sum)
@@ -483,6 +486,7 @@ impl RangeFunction for CountOverTimeFunction {
 mod tests {
     use super::*;
     use crate::model::Sample;
+    use rstest::rstest;
     use std::collections::HashMap;
 
     fn create_sample(value: f64) -> EvalSample {
@@ -819,6 +823,46 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case(vec![1e16, 1.0, -1e16], 1.0, "catastrophic cancellation")]
+    #[case(vec![1e10, 1.0, 1.0, 1.0, 1.0, 1.0, -1e10], 5.0, "small values lost in large sum")]
+    #[case(vec![1e8, 1.0, -1e8, 1.0, 1e8, 1.0, -1e8], 3.0, "alternating magnitudes")]
+    #[case(vec![1.0, 1e100, 1.0, -1e100], 2.0, "Neumaier improvement case")]
+    #[case(vec![0.1; 10], 1.0, "repeated small values")]
+    #[case(vec![1e10, 1e5, 1e0, 1e-5, 1e-10], 1e10 + 1e5 + 1.0 + 1e-5 + 1e-10, "decreasing magnitude")]
+    #[case(vec![1e-10, 1e-5, 1e0, 1e5, 1e10], 1e10 + 1e5 + 1.0 + 1e-5 + 1e-10, "increasing magnitude")]
+    #[case(vec![1e16, -1e16, 1e16, -1e16, 1.0], 1.0, "near-zero with large intermediates")]
+    #[case(vec![1e-100; 1000], 1e-97, "very small repeated values")]
+    #[case(vec![1.0, -2.0, 3.0, -4.0, 5.0], 3.0, "mixed signs")]
+    fn should_handle_kahan_edge_cases(
+        #[case] values: Vec<f64>,
+        #[case] expected: f64,
+        #[case] description: &str,
+    ) {
+        let mut sum = 0.0;
+        let mut c = 0.0;
+        for &val in &values {
+            (sum, c) = kahan_inc(val, sum, c);
+        }
+        let result = sum + c;
+
+        // Use relative error for large values, absolute error for small values
+        let tolerance = if expected.abs() > 1.0 {
+            expected.abs() * 1e-10
+        } else {
+            1e-10
+        };
+
+        assert!(
+            (result - expected).abs() <= tolerance,
+            "Failed case '{}': expected {}, got {}, error {}",
+            description,
+            expected,
+            result,
+            (result - expected).abs()
+        );
+    }
+
     #[test]
     fn should_handle_nan_in_max_over_time() {
         // Test that NaN is replaced by subsequent values (Prometheus behavior)
@@ -893,5 +937,178 @@ mod tests {
             "All-NaN should return NaN, got {}",
             result[0].value
         );
+    }
+
+    // Property-based tests using proptest
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+        use rug::Float;
+
+        /// Generate finite f64 values (no NaN, no infinity)
+        fn finite_f64() -> impl Strategy<Value = f64> {
+            prop::num::f64::NORMAL
+        }
+
+        /// Compute high-precision sum using arbitrary precision arithmetic (oracle)
+        fn oracle_sum_high_precision(values: &[f64]) -> f64 {
+            // Use 256-bit precision (much higher than f64's 53 bits)
+            let mut sum = Float::with_val(256, 0.0);
+            for &val in values {
+                sum += Float::with_val(256, val);
+            }
+            sum.to_f64()
+        }
+
+        /// Compute sum of absolute values for error bound
+        fn sum_abs(values: &[f64]) -> f64 {
+            let mut sum = Float::with_val(256, 0.0);
+            for &val in values {
+                sum += Float::with_val(256, val.abs());
+            }
+            sum.to_f64()
+        }
+
+        proptest! {
+            /// Test that sum_over_time satisfies Kahan error bound:
+            /// |computed_sum - true_sum| ≤ 2ε · Σ|xᵢ| + O(nε²)
+            ///
+            /// We use arbitrary precision arithmetic as the oracle for true_sum.
+            /// See: https://en.wikipedia.org/wiki/Kahan_summation_algorithm#Accuracy
+            #[test]
+            fn sum_over_time_satisfies_kahan_error_bound(
+                values in prop::collection::vec(finite_f64(), 1..100)
+            ) {
+                let registry = FunctionRegistry::new();
+                let func = registry.get_range_function("sum_over_time").unwrap();
+
+                let samples = vec![create_eval_samples(
+                    values.iter().enumerate().map(|(i, &v)| ((i as i64) * 1000, v)).collect(),
+                    HashMap::new(),
+                )];
+
+                let result = func.apply(samples, 0).unwrap();
+                let computed_sum = result[0].value;
+                let true_sum = oracle_sum_high_precision(&values);
+
+                // Skip if overflow occurred (error bound doesn't apply)
+                if computed_sum.is_infinite() || true_sum.is_infinite() {
+                    return Ok(());
+                }
+
+                let error = (computed_sum - true_sum).abs();
+                let sum_of_abs = sum_abs(&values);
+                let n = values.len() as f64;
+
+                // Kahan error bound: |computed - true| ≤ 2ε · Σ|xᵢ| + O(nε²)
+                // We use a slightly relaxed bound to account for the O(nε²) term
+                let epsilon = f64::EPSILON;
+                let error_bound = 2.0 * epsilon * sum_of_abs + n * epsilon * epsilon * sum_of_abs;
+
+                prop_assert!(
+                    error <= error_bound,
+                    "Kahan error bound violated: error={}, bound={}, computed={}, true={}, n={}, Σ|xᵢ|={}",
+                    error, error_bound, computed_sum, true_sum, n, sum_of_abs
+                );
+            }
+
+            /// Test that avg_over_time satisfies error bound (derived from sum)
+            #[test]
+            fn avg_over_time_satisfies_error_bound(
+                values in prop::collection::vec(finite_f64(), 1..100)
+            ) {
+                let registry = FunctionRegistry::new();
+                let func = registry.get_range_function("avg_over_time").unwrap();
+
+                let samples = vec![create_eval_samples(
+                    values.iter().enumerate().map(|(i, &v)| ((i as i64) * 1000, v)).collect(),
+                    HashMap::new(),
+                )];
+
+                let result = func.apply(samples, 0).unwrap();
+                let computed_avg = result[0].value;
+                let true_sum = oracle_sum_high_precision(&values);
+                let true_avg = true_sum / (values.len() as f64);
+
+                // Skip if overflow occurred
+                if computed_avg.is_infinite() || true_avg.is_infinite() {
+                    return Ok(());
+                }
+
+                let error = (computed_avg - true_avg).abs();
+                let sum_of_abs = sum_abs(&values);
+                let n = values.len() as f64;
+
+                // Error bound for average: divide sum error bound by n
+                let epsilon = f64::EPSILON;
+                let error_bound = (2.0 * epsilon * sum_of_abs + n * epsilon * epsilon * sum_of_abs) / n;
+
+                prop_assert!(
+                    error <= error_bound,
+                    "avg_over_time error bound violated: error={}, bound={}, computed={}, true={}, n={}",
+                    error, error_bound, computed_avg, true_avg, n
+                );
+            }
+
+            /// Test that min_over_time returns the actual minimum
+            #[test]
+            fn min_over_time_returns_minimum(
+                values in prop::collection::vec(finite_f64(), 1..100)
+            ) {
+                let registry = FunctionRegistry::new();
+                let func = registry.get_range_function("min_over_time").unwrap();
+
+                let samples = vec![create_eval_samples(
+                    values.iter().enumerate().map(|(i, &v)| ((i as i64) * 1000, v)).collect(),
+                    HashMap::new(),
+                )];
+
+                let result = func.apply(samples, 0).unwrap();
+                let computed_min = result[0].value;
+                let expected_min = values.iter().copied().fold(f64::INFINITY, f64::min);
+
+                assert_eq!(computed_min, expected_min, "min_over_time should return exact minimum");
+            }
+
+            /// Test that max_over_time returns the actual maximum
+            #[test]
+            fn max_over_time_returns_maximum(
+                values in prop::collection::vec(finite_f64(), 1..100)
+            ) {
+                let registry = FunctionRegistry::new();
+                let func = registry.get_range_function("max_over_time").unwrap();
+
+                let samples = vec![create_eval_samples(
+                    values.iter().enumerate().map(|(i, &v)| ((i as i64) * 1000, v)).collect(),
+                    HashMap::new(),
+                )];
+
+                let result = func.apply(samples, 0).unwrap();
+                let computed_max = result[0].value;
+                let expected_max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+
+                assert_eq!(computed_max, expected_max, "max_over_time should return exact maximum");
+            }
+
+            /// Test that count_over_time returns the correct count
+            #[test]
+            fn count_over_time_returns_count(
+                values in prop::collection::vec(finite_f64(), 1..100)
+            ) {
+                let registry = FunctionRegistry::new();
+                let func = registry.get_range_function("count_over_time").unwrap();
+
+                let samples = vec![create_eval_samples(
+                    values.iter().enumerate().map(|(i, &v)| ((i as i64) * 1000, v)).collect(),
+                    HashMap::new(),
+                )];
+
+                let result = func.apply(samples, 0).unwrap();
+                let computed_count = result[0].value;
+                let expected_count = values.len() as f64;
+
+                assert_eq!(computed_count, expected_count, "count_over_time should return exact count");
+            }
+        }
     }
 }
